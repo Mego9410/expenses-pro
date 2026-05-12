@@ -1,0 +1,2 @@
+# Used by scripts/parse_statement.py (PDF text layer). Install: pip install -r requirements-statement.txt
+pymupdf>=1.24.0
