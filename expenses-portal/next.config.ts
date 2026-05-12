@@ -2,10 +2,10 @@ import type { NextConfig } from "next";
 import path from "node:path";
 
 const nextConfig: NextConfig = {
-  // Avoid Next.js inferring an ancestor directory as the workspace root
-  // (there's a package-lock.json higher up in C:\Users\olive).
+  // Parent repo (npm workspaces) has its own package-lock — without this,
+  // Turbopack can infer the wrong root and fail to resolve `next`.
   turbopack: {
-    root: path.resolve(__dirname),
+    root: path.join(__dirname),
   },
   // exceljs has some optional deps that don't need bundling.
   serverExternalPackages: ["exceljs"],
