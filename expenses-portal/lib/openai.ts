@@ -20,6 +20,23 @@ function getClient(): OpenAI {
   return _client;
 }
 
+/** Integer seed for reproducible sampling (vision is still best-effort, not cryptographic). */
+function getOpenAiSeed(): number {
+  const raw = process.env.OPENAI_SEED;
+  if (raw === undefined || raw === "") return 424_242;
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) ? n : 424_242;
+}
+
+/** Shared sampling defaults for every vision / JSON call. */
+const DETERMINISTIC_LLM = {
+  temperature: 0,
+  top_p: 1,
+  seed: getOpenAiSeed(),
+  frequency_penalty: 0,
+  presence_penalty: 0,
+} as const;
+
 export const ExtractedRowSchema = z.object({
   narrative: z.string().min(1),
   gross: z.number(),
@@ -150,6 +167,13 @@ const EXTRACTION_JSON_SCHEMA = {
   required: ["rows"],
 } as const;
 
+function dataUrlForImageBuffer(buf: Buffer): string {
+  const isJpeg =
+    buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff;
+  const mime = isJpeg ? "image/jpeg" : "image/png";
+  return `data:${mime};base64,${buf.toString("base64")}`;
+}
+
 async function extractFromImage(
   pngBuffer: Buffer,
   pageIndex: number,
@@ -160,7 +184,7 @@ async function extractFromImage(
   );
   const response = await getClient().chat.completions.create({
     model: "gpt-4o",
-    temperature: 0,
+    ...DETERMINISTIC_LLM,
     response_format: {
       type: "json_schema",
       json_schema: {
@@ -181,7 +205,7 @@ async function extractFromImage(
           {
             type: "image_url",
             image_url: {
-              url: `data:image/png;base64,${pngBuffer.toString("base64")}`,
+              url: dataUrlForImageBuffer(pngBuffer),
               detail: "high",
             },
           },
@@ -354,13 +378,103 @@ function buildReconcileSystemPrompt(attempt: ReconcileAttempt): string {
   return `${RECONCILE_BASE}\n${reconcileStrategySection(attempt)}`;
 }
 
-const RECONCILE_TEMPERATURE: Record<ReconcileAttempt, number> = {
-  1: 0,
-  2: 0.1,
-  3: 0.2,
-  4: 0.14,
-  5: 0.26,
-};
+const StatementTotalResponseSchema = z.object({
+  found: z.boolean(),
+  expected_total: z.number(),
+});
+
+const STATEMENT_TOTAL_JSON_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    found: { type: "boolean" },
+    expected_total: { type: "number" },
+  },
+  required: ["found", "expected_total"],
+} as const;
+
+const STATEMENT_TOTAL_SYSTEM = `You read UK-style credit-card statement images. Reply with JSON only.
+
+Find the single figure that is the GRAND TOTAL OF NEW TRANSACTIONS THIS BILLING PERIOD (new debits minus new credits in the itemized list). It is what should foot to the sum of the transaction lines — NOT "Closing balance", NOT "New balance", NOT "Previous balance" / "Balance brought forward", NOT "Payment received" / "Thank you", NOT "Amount due" if that mixes in carried-forward balance.
+
+Prefer a line labelled like: "Total payments", "Total of new transactions", "Total debits this period" (net of credits), or a bold TOTAL aligned with the end of the transaction table.
+
+Set "found" to true only if you clearly read that total. Set "found" to false if the statement is unreadable or ambiguous — do not guess a random number when unsure.
+
+When found is true, "expected_total" must match the printed GBP total to 2 decimal places.`;
+
+async function readStatementTotalOnce(
+  pngBuffers: Buffer[],
+  seed: number,
+): Promise<number | null> {
+  const userContent: OpenAI.Chat.Completions.ChatCompletionContentPart[] = [
+    {
+      type: "text",
+      text: `You are given ${pngBuffers.length} scanned page(s) of ONE statement (in order). Read the total described in the system prompt.`,
+    },
+    ...pngBuffers.map(
+      (buf) =>
+        ({
+          type: "image_url",
+          image_url: {
+            url: dataUrlForImageBuffer(buf),
+            detail: "high" as const,
+          },
+        }) as OpenAI.Chat.Completions.ChatCompletionContentPart,
+    ),
+  ];
+
+  const response = await getClient().chat.completions.create({
+    model: "gpt-4o",
+    ...DETERMINISTIC_LLM,
+    seed,
+    response_format: {
+      type: "json_schema",
+      json_schema: {
+        name: "statement_total_only",
+        strict: true,
+        schema: STATEMENT_TOTAL_JSON_SCHEMA,
+      },
+    },
+    messages: [
+      { role: "system", content: STATEMENT_TOTAL_SYSTEM },
+      { role: "user", content: userContent },
+    ],
+  });
+
+  const raw = response.choices[0]?.message?.content;
+  if (!raw) return null;
+  try {
+    const parsed = StatementTotalResponseSchema.parse(JSON.parse(raw));
+    if (!parsed.found) return null;
+    return parsed.expected_total;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Two independent reads (different seeds) + median if they disagree —
+ * stabilises the target total before row-level reconciliation.
+ */
+async function resolveStatementTotal(
+  pngBuffers: Buffer[],
+): Promise<number | null> {
+  if (pngBuffers.length === 0) return null;
+  const base = getOpenAiSeed();
+  const [a, b] = await Promise.all([
+    readStatementTotalOnce(pngBuffers, base),
+    readStatementTotalOnce(pngBuffers, base + 1_001_001),
+  ]);
+  if (a === null && b === null) return null;
+  if (a === null) return b;
+  if (b === null) return a;
+  if (Math.abs(a - b) <= 0.02) return (a + b) / 2;
+  const c = await readStatementTotalOnce(pngBuffers, base + 2_002_002);
+  if (c === null) return (a + b) / 2;
+  const sorted = [a, b, c].sort((x, y) => x - y);
+  return sorted[1]!;
+}
 
 export const RECONCILE_METHOD_LABELS: Record<ReconcileAttempt, string> = {
   1: "Pairing audit",
@@ -415,9 +529,8 @@ async function reconcileExpenses(
 ): Promise<{ rows: ExtractedRow[]; expectedTotal: number | null }> {
   const started = Date.now();
   const currentSum = ctx.sumBefore;
-  const temp = RECONCILE_TEMPERATURE[attempt];
   console.log(
-    `[reconcile] attempt ${attempt} (method ${attempt}, temp=${temp}): ${currentRows.length} rows, sum=${currentSum.toFixed(2)}, ` +
+    `[reconcile] attempt ${attempt} (method ${attempt}): ${currentRows.length} rows, sum=${currentSum.toFixed(2)}, ` +
       `hintExpected=${ctx.expectedTotalHint?.toFixed(2) ?? "n/a"}, gap=${ctx.gap?.toFixed(2) ?? "n/a"}, ${pngBuffers.length} page(s)`,
   );
 
@@ -434,6 +547,11 @@ async function reconcileExpenses(
       `You MUST follow the numbered RECONCILIATION METHOD ${attempt} in the system prompt exactly — do not merely repeat the same corrections as before.`;
   }
 
+  const anchoredTotalNote =
+    ctx.expectedTotalHint !== null
+      ? `\n\nANCHORED TOTAL — an independent double-read of the images fixed the printed new-transactions total at ${ctx.expectedTotalHint.toFixed(2)} GBP. Your JSON "expected_total" MUST be exactly this number, and sum(rows[].gross) MUST equal it to 2dp. Do not substitute closing balance, new balance, or previous balance.`
+      : "";
+
   const userContent: OpenAI.Chat.Completions.ChatCompletionContentPart[] = [
     {
       type: "text",
@@ -442,6 +560,7 @@ async function reconcileExpenses(
         `Current extracted rows (JSON):\n${JSON.stringify(currentRows, null, 2)}\n\n` +
         `Current sum of gross: ${currentSum.toFixed(2)}.\n\n` +
         `Find the printed TOTAL OF NEW TRANSACTIONS THIS PERIOD (NOT the closing/new balance, NOT the previous balance). Return expected_total and a corrected rows array such that sum(rows.gross) == expected_total to 2dp.` +
+        anchoredTotalNote +
         gapNote,
     },
     ...pngBuffers.map(
@@ -449,7 +568,7 @@ async function reconcileExpenses(
         ({
           type: "image_url",
           image_url: {
-            url: `data:image/png;base64,${buf.toString("base64")}`,
+            url: dataUrlForImageBuffer(buf),
             detail: "high",
           },
         }) as OpenAI.Chat.Completions.ChatCompletionContentPart,
@@ -458,7 +577,7 @@ async function reconcileExpenses(
 
   const response = await getClient().chat.completions.create({
     model: "gpt-4o",
-    temperature: temp,
+    ...DETERMINISTIC_LLM,
     response_format: {
       type: "json_schema",
       json_schema: {
@@ -549,31 +668,31 @@ export async function extractExpenses(
   if (pngBuffers.length === 0) return { rows: [], expectedTotal: null };
 
   const totalPages = pngBuffers.length;
-  const perPage = await Promise.all(
-    pngBuffers.map(async (buf, i) => {
-      onEvent({ type: "page_start", page: i + 1, totalPages });
-      try {
-        const rows = await extractFromImage(buf, i);
-        onEvent({
-          type: "page_done",
-          page: i + 1,
-          totalPages,
-          rowCount: rows.length,
-        });
-        return rows;
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        console.error(`[extract] page ${i + 1} threw:`, err);
-        onEvent({
-          type: "page_error",
-          page: i + 1,
-          totalPages,
-          message,
-        });
-        return [] as ExtractedRow[];
-      }
-    }),
-  );
+  const perPage: ExtractedRow[][] = [];
+  for (let i = 0; i < pngBuffers.length; i++) {
+    const buf = pngBuffers[i]!;
+    onEvent({ type: "page_start", page: i + 1, totalPages });
+    try {
+      const pageRows = await extractFromImage(buf, i);
+      onEvent({
+        type: "page_done",
+        page: i + 1,
+        totalPages,
+        rowCount: pageRows.length,
+      });
+      perPage.push(pageRows);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[extract] page ${i + 1} threw:`, err);
+      onEvent({
+        type: "page_error",
+        page: i + 1,
+        totalPages,
+        message,
+      });
+      perPage.push([]);
+    }
+  }
   let seq = 0;
   const all = perPage.flat().map((r) => ({
     ...r,
@@ -602,10 +721,21 @@ export async function extractExpenses(
     sum: Number(sumRows(rows).toFixed(2)),
   });
 
+  const consensusTotal = await resolveStatementTotal(pngBuffers);
+  if (consensusTotal !== null) {
+    console.log(
+      `[extract] consensus printed new-transactions total: ${consensusTotal.toFixed(2)}`,
+    );
+  } else {
+    console.log(
+      "[extract] no consensus total from double-read — falling back to first reconcile pass for expected_total",
+    );
+  }
+
   // Reconcile against the printed statement total — up to 5 passes, different method each time.
   const MAX_ATTEMPTS = 5;
-  /** First non-null expected_total from the model — reused for gap math so retries don't chase a moving target. */
-  let stabilizedExpectedTotal: number | null = null;
+  /** Target total: double-read consensus when available, else first model-reported expected_total. */
+  let stabilizedExpectedTotal: number | null = consensusTotal;
   let best: ReconcileBestState = {
     rows,
     attempt: 0,
@@ -778,7 +908,7 @@ export async function categorizeExpenseRows(
 
     const response = await getClient().chat.completions.create({
       model: "gpt-4o-mini",
-      temperature: 0,
+      ...DETERMINISTIC_LLM,
       response_format: {
         type: "json_schema",
         json_schema: {
