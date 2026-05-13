@@ -24,6 +24,7 @@ import {
 } from "@/lib/statement-sort";
 import { rotateImageBlob } from "@/lib/image-adjust";
 import { rasterizePdfClient } from "@/lib/pdf-client";
+import { ensureUploadBlobsFitBudget } from "@/lib/upload-budget";
 import { cn, formatGBP } from "@/lib/utils";
 
 type Row = {
@@ -180,7 +181,7 @@ export default function Home() {
     setError(null);
     try {
       const blobs = await rasterizePdfClient(file, {
-        width: 2400,
+        width: 2200,
         maxPages: 20,
       });
       setPageAdjust({
@@ -251,7 +252,7 @@ export default function Home() {
         });
       } else {
         pages = await rasterizePdfClient(file, {
-          width: 2400,
+          width: 1900,
           maxPages: 20,
           signal,
           onProgress: ({ page, totalPages }) =>
@@ -270,17 +271,37 @@ export default function Home() {
 
       throwIfAborted(signal);
 
-      const fd = new FormData();
-      fd.append("pdf", file, file.name || "statement.pdf");
-      pages.forEach((blob, idx) => {
-        fd.append("images", blob, `page-${idx + 1}.png`);
+      upsertTask({
+        id: "upload-prep",
+        label: "Preparing images for upload (Vercel ~4 MB limit)",
+        state: "running",
       });
+      const uploadPages = await ensureUploadBlobsFitBudget(pages);
+      upsertTask({
+        id: "upload-prep",
+        label: `Upload payload ~${(uploadPages.reduce((s, b) => s + b.size, 0) / 1024).toFixed(0)} KB`,
+        state: "done",
+      });
+
+      const fd = new FormData();
+      // Vision path only needs page images. Omitting the PDF avoids doubling payload
+      // (Vercel serverless request bodies are capped at about 4.5 MB).
+      for (let idx = 0; idx < uploadPages.length; idx++) {
+        const blob = uploadPages[idx]!;
+        const ext = blob.type === "image/jpeg" ? "jpg" : "png";
+        fd.append("images", blob, `page-${idx + 1}.${ext}`);
+      }
 
       const res = await fetch("/api/extract", {
         method: "POST",
         body: fd,
         signal,
       });
+      if (res.status === 413) {
+        throw new Error(
+          "Upload too large for this host (about 4 MB per request). Try fewer pages or run the app locally.",
+        );
+      }
       if (!res.ok || !res.body) {
         const text = await res.text().catch(() => "");
         let msg = `HTTP ${res.status}`;
