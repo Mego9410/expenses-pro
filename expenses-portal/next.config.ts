@@ -2,10 +2,10 @@ import type { NextConfig } from "next";
 import path from "node:path";
 
 const nextConfig: NextConfig = {
-  // Parent repo (npm workspaces) has its own package-lock — without this,
-  // Turbopack can infer the wrong root and fail to resolve `next`.
+  // Monorepo root must match Vercel’s `outputFileTracingRoot` (/vercel/path0) or
+  // Next warns and Turbopack can mis-resolve deps.
   turbopack: {
-    root: path.join(__dirname),
+    root: path.join(__dirname, ".."),
   },
   // exceljs has some optional deps that don't need bundling.
   serverExternalPackages: ["exceljs"],
