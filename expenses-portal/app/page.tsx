@@ -25,6 +25,7 @@ import {
 import { rotateImageBlob } from "@/lib/image-adjust";
 import { rasterizePdfClient } from "@/lib/pdf-client";
 import { ensureUploadBlobsFitBudget } from "@/lib/upload-budget";
+import { ocrStatementPages } from "@/lib/ocr-client";
 import { cn, formatGBP } from "@/lib/utils";
 
 type Row = {
@@ -107,7 +108,7 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [extractedPages, setExtractedPages] = useState<number | null>(null);
   const [extractionSource, setExtractionSource] = useState<
-    "python" | "vision" | null
+    "python" | "vision" | "ocr" | null
   >(null);
   const [expectedTotal, setExpectedTotal] = useState<number | null>(null);
   const [pageAdjust, setPageAdjust] = useState<PageAdjustState | null>(null);
@@ -272,6 +273,50 @@ export default function Home() {
       throwIfAborted(signal);
 
       upsertTask({
+        id: "ocr",
+        label: "Recognising text on each page (like Acrobat OCR)",
+        state: "running",
+      });
+      let ocrJson: string | null = null;
+      try {
+        const pageTexts = await ocrStatementPages(pages, {
+          signal,
+          onProgress: ({ page, totalPages }) => {
+            upsertTask({
+              id: "ocr",
+              label: `OCR — page ${page} of ${totalPages}`,
+              state: "running",
+            });
+          },
+        });
+        const capped = pageTexts.map((t) =>
+          t.length > 18_000 ? t.slice(0, 18_000) : t,
+        );
+        const charTotal = capped.join("").trim().length;
+        if (charTotal >= 80) {
+          const payload = JSON.stringify(capped);
+          if (new Blob([payload]).size < 1_800_000) {
+            ocrJson = payload;
+          }
+        }
+        upsertTask({
+          id: "ocr",
+          label:
+            ocrJson !== null
+              ? `OCR: ${capped.length} page(s), ~${(charTotal / 1024).toFixed(1)} KB text`
+              : "OCR produced little text — server will use vision on images",
+          state: "done",
+        });
+      } catch (ocrErr) {
+        console.warn("[extract] OCR failed:", ocrErr);
+        upsertTask({
+          id: "ocr",
+          label: "OCR failed — server will use vision on images",
+          state: "done",
+        });
+      }
+
+      upsertTask({
         id: "upload-prep",
         label: "Preparing images for upload (Vercel ~4 MB limit)",
         state: "running",
@@ -290,6 +335,9 @@ export default function Home() {
         const blob = uploadPages[idx]!;
         const ext = blob.type === "image/jpeg" ? "jpg" : "png";
         fd.append("images", blob, `page-${idx + 1}.${ext}`);
+      }
+      if (ocrJson !== null) {
+        fd.append("ocr_json", ocrJson);
       }
 
       const res = await fetch("/api/extract", {
@@ -380,6 +428,13 @@ export default function Home() {
           upsertTask({
             id: "pdf-parser",
             label: "Extracting text from PDF (Python)",
+            state: "running",
+          });
+        }
+        if (event.extraction === "ocr") {
+          upsertTask({
+            id: "ocr-pipeline",
+            label: "Turning recognised text into rows (AI), then verifying on images",
             state: "running",
           });
         }
@@ -518,9 +573,11 @@ export default function Home() {
         setExtractionSource(
           event.extraction === "python"
             ? "python"
-            : event.extraction === "vision"
-              ? "vision"
-              : null,
+            : event.extraction === "ocr"
+              ? "ocr"
+              : event.extraction === "vision"
+                ? "vision"
+                : null,
         );
         setExpectedTotal(expected);
         break;
@@ -927,9 +984,13 @@ export default function Home() {
                         ? `PDF text extraction — ${extractedPages} page${
                             extractedPages === 1 ? "" : "s"
                           } — `
-                        : `Parsed ${extractedPages} page${
-                            extractedPages === 1 ? "" : "s"
-                          } — `)}
+                        : extractionSource === "ocr"
+                          ? `OCR text → AI rows — ${extractedPages} page${
+                              extractedPages === 1 ? "" : "s"
+                            } (images used to verify totals) — `
+                          : `Parsed ${extractedPages} page${
+                              extractedPages === 1 ? "" : "s"
+                            } — `)}
                     review and edit before generating. Rows are ordered by
                     statement date / position ({rows.length} lines; Excel export
                     grows past the default {BUNDLED_TEMPLATE_DATA_ROWS} rows, up
@@ -1089,7 +1150,8 @@ export default function Home() {
 
           <footer className="mt-12 text-center text-xs text-neutral-600">
             Built locally &middot; receipts and spreadsheets never leave your
-            machine except for the OpenAI vision call.
+            machine except for the OpenAI API (OCR is in your browser; rows and
+            checks use GPT‑4o).
           </footer>
         </div>
       </div>

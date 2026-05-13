@@ -248,6 +248,103 @@ async function extractFromImage(
   }));
 }
 
+/** Same extraction rules as vision, but input is OCR plain text (Adobe-style "Recognize Text"). */
+const OCR_TEXT_PROMPT = `You are an expert bookkeeper extracting line items from ONE PAGE of a UK credit-card statement.
+
+The user message contains TEXT from OCR (optical character recognition) of that page — like Adobe Acrobat "Recognize Text". Lines follow rough top-to-bottom order but OCR may split columns, drop spaces, misread characters (0/O, 1/l, 5/S, 8/B), or insert noise. Reconstruct the underlying transaction TABLE mentally.
+
+=== PAIRING / ORDERING (same as for a clean scan) ===
+
+1. Scan the text from TOP to BOTTOM. List every TRANSACTION DATE that starts a new line item (e.g. "20 Mar 2026", "20 MAR 2026", "20 Mar 26"). Skip summary / heading rows (see LINES TO SKIP). Call this D1…Dn in order.
+
+2. List every main GBP transaction TOTAL in the SAME reading order as those dates: A1…An.
+   - Ignore numbers that are clearly FX / USD / reference noise in the middle of a description block.
+   - Amounts with "CR" (possibly OCR'd as "CR", "C R", "cr") are CREDITS — output NEGATIVE gross.
+
+3. Narrative for row i = first merchant or title line in the same block as Di (not reference/FX continuation lines).
+
+4. Output EXACTLY n rows: row i = (narrative from block i, gross from Ai, date Di).
+
+5. If unsure which amount pairs with which date, trust vertical reading order in the OCR text.
+
+THE DATE RULE: one output row per qualifying date Di, in order.
+
+LINES TO SKIP (same as image extraction):
+- Previous balance, balance brought forward, opening balance
+- Payment received, thank you, direct debit received
+- Closing balance, new balance, total payments due, amount due (when it mixes carried-forward)
+- Sub-totals and headings that are not merchant lines
+
+For each row output:
+- "transaction_date": as printed (normalise obvious OCR spacing but keep the meaning, e.g. "20 Mar 2026")
+- "narrative": merchant verbatim from OCR when readable; "(unreadable)" only if needed
+- "gross": GBP number, negative for credits
+- "category": MUST be EXACTLY one of:
+${CATEGORIES.map((c) => `  - ${c}`).join("\n")}
+
+${CATEGORY_GUIDANCE}
+
+CRITICAL:
+- Do NOT invent transactions; only rows supported by the OCR text.
+- Do NOT skip qualifying dated lines including small amounts and CR credits.
+- Return ONLY valid JSON matching the schema.`;
+
+async function extractFromOcrPageText(
+  ocrText: string,
+  pageIndex: number,
+): Promise<ExtractedRow[]> {
+  const normalized = ocrText.trim();
+  if (normalized.length < 12) {
+    console.log(
+      `[ocr-extract] page ${pageIndex + 1}: skipping (OCR text too short)`,
+    );
+    return [];
+  }
+  const started = Date.now();
+  const clipped = normalized.length > 28_000 ? normalized.slice(0, 28_000) : normalized;
+  console.log(
+    `[ocr-extract] page ${pageIndex + 1}: ${clipped.length} chars OCR text`,
+  );
+  const response = await getClient().chat.completions.create({
+    model: "gpt-4o",
+    ...DETERMINISTIC_LLM,
+    response_format: {
+      type: "json_schema",
+      json_schema: {
+        name: "expense_extraction_ocr",
+        strict: true,
+        schema: EXTRACTION_JSON_SCHEMA,
+      },
+    },
+    messages: [
+      { role: "system", content: OCR_TEXT_PROMPT },
+      {
+        role: "user",
+        content:
+          `This is page ${pageIndex + 1} of a statement. OCR text follows (read top-to-bottom; repair obvious OCR errors when inferring amounts and dates):\n\n` +
+          clipped,
+      },
+    ],
+  });
+
+  const raw = response.choices[0]?.message?.content;
+  const elapsed = ((Date.now() - started) / 1000).toFixed(1);
+  console.log(
+    `[ocr-extract] page ${pageIndex + 1}: done in ${elapsed}s, raw chars=${raw?.length ?? 0}`,
+  );
+  if (!raw) return [];
+  try {
+    const parsed = ResponseSchema.parse(JSON.parse(raw));
+    return parsed.rows.map((r) => ({
+      ...r,
+      category: coerceCategory(r.category),
+    }));
+  } catch (err) {
+    console.error(`[ocr-extract] page ${pageIndex + 1}: parse failed`, err);
+    return [];
+  }
+}
+
 function sumRows(rows: ExtractedRow[]): number {
   return rows.reduce((s, r) => s + (Number.isFinite(r.gross) ? r.gross : 0), 0);
 }
@@ -661,48 +758,21 @@ export type ExtractProgressEvent =
       size: number;
     };
 
-export async function extractExpenses(
+async function runExtractPostProcess(
+  perPageRows: ExtractedRow[][],
   pngBuffers: Buffer[],
-  onEvent: (e: ExtractProgressEvent) => void = () => {},
+  onEvent: (e: ExtractProgressEvent) => void,
+  logPrefix: string,
 ): Promise<{ rows: ExtractedRow[]; expectedTotal: number | null }> {
-  if (pngBuffers.length === 0) return { rows: [], expectedTotal: null };
-
-  const totalPages = pngBuffers.length;
-  const perPage: ExtractedRow[][] = [];
-  for (let i = 0; i < pngBuffers.length; i++) {
-    const buf = pngBuffers[i]!;
-    onEvent({ type: "page_start", page: i + 1, totalPages });
-    try {
-      const pageRows = await extractFromImage(buf, i);
-      onEvent({
-        type: "page_done",
-        page: i + 1,
-        totalPages,
-        rowCount: pageRows.length,
-      });
-      perPage.push(pageRows);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      console.error(`[extract] page ${i + 1} threw:`, err);
-      onEvent({
-        type: "page_error",
-        page: i + 1,
-        totalPages,
-        message,
-      });
-      perPage.push([]);
-    }
-  }
   let seq = 0;
-  const all = perPage.flat().map((r) => ({
+  const all = perPageRows.flat().map((r) => ({
     ...r,
     statement_index: ++seq,
   }));
   console.log(
-    `[extract] total ${all.length} rows across ${pngBuffers.length} page(s) before reconciliation`,
+    `${logPrefix} total ${all.length} rows across ${pngBuffers.length} page(s) before reconciliation`,
   );
 
-  // Light de-duplication across pages: same date + merchant + gross to 2dp.
   const seen = new Set<string>();
   let rows: ExtractedRow[] = [];
   for (const r of all) {
@@ -713,7 +783,7 @@ export async function extractExpenses(
   }
   rows = rows.map((r, i) => ({ ...r, statement_index: i + 1 }));
   console.log(
-    `[extract] ${rows.length} rows after dedupe, sum=${sumRows(rows).toFixed(2)}`,
+    `${logPrefix} ${rows.length} rows after dedupe, sum=${sumRows(rows).toFixed(2)}`,
   );
   onEvent({
     type: "dedupe_done",
@@ -724,17 +794,15 @@ export async function extractExpenses(
   const consensusTotal = await resolveStatementTotal(pngBuffers);
   if (consensusTotal !== null) {
     console.log(
-      `[extract] consensus printed new-transactions total: ${consensusTotal.toFixed(2)}`,
+      `${logPrefix} consensus printed new-transactions total: ${consensusTotal.toFixed(2)}`,
     );
   } else {
     console.log(
-      "[extract] no consensus total from double-read — falling back to first reconcile pass for expected_total",
+      `${logPrefix} no consensus total from double-read — falling back to first reconcile pass for expected_total`,
     );
   }
 
-  // Reconcile against the printed statement total — up to 5 passes, different method each time.
   const MAX_ATTEMPTS = 5;
-  /** Target total: double-read consensus when available, else first model-reported expected_total. */
   let stabilizedExpectedTotal: number | null = consensusTotal;
   let best: ReconcileBestState = {
     rows,
@@ -794,7 +862,6 @@ export async function extractExpenses(
       break;
     }
 
-    // Prefer the input (previous best) and this attempt's output — closest to statement total wins.
     const scoredInput = scoreRowsAgainstExpected(
       inputRows,
       best.attempt,
@@ -811,8 +878,7 @@ export async function extractExpenses(
     best = newBest;
 
     const attemptSum = sumRows(result.rows);
-    const attemptMatched =
-      Math.abs(attemptSum - compareExpected) <= 0.01;
+    const attemptMatched = Math.abs(attemptSum - compareExpected) <= 0.01;
     onEvent({
       type: "reconcile_done",
       attempt,
@@ -844,13 +910,88 @@ export async function extractExpenses(
 
   if (rows.length > TEMPLATE_MAX_EXPENSE_ROWS) {
     console.warn(
-      `[extract] ${rows.length} rows exceed export cap (${TEMPLATE_MAX_EXPENSE_ROWS}); user must remove lines to generate the spreadsheet.`,
+      `${logPrefix} ${rows.length} rows exceed export cap (${TEMPLATE_MAX_EXPENSE_ROWS}); user must remove lines to generate the spreadsheet.`,
     );
   }
   console.log(
-    `[extract] final ${rows.length} rows, sum=${sumRows(rows).toFixed(2)}, expectedTotal=${expectedTotal === null ? "n/a" : expectedTotal.toFixed(2)}`,
+    `${logPrefix} final ${rows.length} rows, sum=${sumRows(rows).toFixed(2)}, expectedTotal=${expectedTotal === null ? "n/a" : expectedTotal.toFixed(2)}`,
   );
   return { rows, expectedTotal };
+}
+
+export async function extractExpenses(
+  pngBuffers: Buffer[],
+  onEvent: (e: ExtractProgressEvent) => void = () => {},
+): Promise<{ rows: ExtractedRow[]; expectedTotal: number | null }> {
+  if (pngBuffers.length === 0) return { rows: [], expectedTotal: null };
+
+  const totalPages = pngBuffers.length;
+  const perPage: ExtractedRow[][] = [];
+  for (let i = 0; i < pngBuffers.length; i++) {
+    const buf = pngBuffers[i]!;
+    onEvent({ type: "page_start", page: i + 1, totalPages });
+    try {
+      const pageRows = await extractFromImage(buf, i);
+      onEvent({
+        type: "page_done",
+        page: i + 1,
+        totalPages,
+        rowCount: pageRows.length,
+      });
+      perPage.push(pageRows);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[extract] page ${i + 1} threw:`, err);
+      onEvent({
+        type: "page_error",
+        page: i + 1,
+        totalPages,
+        message,
+      });
+      perPage.push([]);
+    }
+  }
+  return runExtractPostProcess(perPage, pngBuffers, onEvent, "[extract]");
+}
+
+/**
+ * Page text from client-side OCR (e.g. Tesseract), then same dedupe / consensus /
+ * vision reconcile pipeline as {@link extractExpenses}.
+ */
+export async function extractExpensesFromOcr(
+  pageTexts: string[],
+  pngBuffers: Buffer[],
+  onEvent: (e: ExtractProgressEvent) => void = () => {},
+): Promise<{ rows: ExtractedRow[]; expectedTotal: number | null }> {
+  if (pngBuffers.length === 0) return { rows: [], expectedTotal: null };
+
+  const totalPages = pngBuffers.length;
+  const perPage: ExtractedRow[][] = [];
+  for (let i = 0; i < totalPages; i++) {
+    onEvent({ type: "page_start", page: i + 1, totalPages });
+    try {
+      const text = pageTexts[i] ?? "";
+      const pageRows = await extractFromOcrPageText(text, i);
+      onEvent({
+        type: "page_done",
+        page: i + 1,
+        totalPages,
+        rowCount: pageRows.length,
+      });
+      perPage.push(pageRows);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[ocr-extract] page ${i + 1} threw:`, err);
+      onEvent({
+        type: "page_error",
+        page: i + 1,
+        totalPages,
+        message,
+      });
+      perPage.push([]);
+    }
+  }
+  return runExtractPostProcess(perPage, pngBuffers, onEvent, "[ocr-extract]");
 }
 
 const CATEGORY_ASSIGN_SYSTEM = `You assign ONLY the accounting category (Reason / Type of Expenditure) for each expense line.

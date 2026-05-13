@@ -4,6 +4,7 @@ import path from "node:path";
 import {
   categorizeExpenseRows,
   extractExpenses,
+  extractExpensesFromOcr,
   type ExtractProgressEvent,
 } from "@/lib/openai";
 import { runStatementPython } from "@/lib/python-statement";
@@ -18,14 +19,14 @@ type ServerEvent =
       type: "start";
       pageCount: number;
       imageSizesKB: number[];
-      extraction?: "python" | "vision";
+      extraction?: "python" | "vision" | "ocr";
     }
   | {
       type: "complete";
       rows: Awaited<ReturnType<typeof extractExpenses>>["rows"];
       pageCount: number;
       expectedTotal: number | null;
-      extraction?: "python" | "vision";
+      extraction?: "python" | "vision" | "ocr";
     }
   | { type: "error"; message: string };
 
@@ -34,6 +35,7 @@ export async function POST(req: NextRequest) {
 
   let pngBuffers: Buffer[] = [];
   let pdfBuffer: Buffer | null = null;
+  let ocrPages: string[] = [];
   try {
     const form = await req.formData();
     const entries = form.getAll("images");
@@ -45,6 +47,21 @@ export async function POST(req: NextRequest) {
     const pdfField = form.get("pdf");
     if (pdfField instanceof File && pdfField.size > 0) {
       pdfBuffer = Buffer.from(await pdfField.arrayBuffer());
+    }
+    const ocrField = form.get("ocr_json");
+    if (typeof ocrField === "string" && ocrField.length > 0) {
+      try {
+        const parsed = JSON.parse(ocrField) as unknown;
+        if (Array.isArray(parsed)) {
+          ocrPages = parsed.map((x) => String(x ?? ""));
+        }
+      } catch {
+        ocrPages = [];
+      }
+    }
+    while (ocrPages.length < pngBuffers.length) ocrPages.push("");
+    if (ocrPages.length > pngBuffers.length) {
+      ocrPages = ocrPages.slice(0, pngBuffers.length);
     }
   } catch (err) {
     return jsonError(
@@ -120,6 +137,13 @@ export async function POST(req: NextRequest) {
             pyResult.rows.length > 0 &&
             pyResult.source !== "error";
 
+          const ocrCharTotal = ocrPages.join("").length;
+          const useOcr =
+            !usePython &&
+            pngBuffers.length > 0 &&
+            ocrCharTotal >= 120 &&
+            ocrPages.some((t) => t.trim().length > 40);
+
           if (!usePython && pngBuffers.length === 0) {
             send({
               type: "error",
@@ -133,7 +157,7 @@ export async function POST(req: NextRequest) {
             type: "start",
             pageCount: usePython ? 0 : pngBuffers.length,
             imageSizesKB: pngBuffers.map((b) => Math.round(b.length / 1024)),
-            extraction: usePython ? "python" : "vision",
+            extraction: usePython ? "python" : useOcr ? "ocr" : "vision",
           });
 
           if (usePython && pyResult) {
@@ -155,6 +179,36 @@ export async function POST(req: NextRequest) {
               pageCount: pyResult.page_count ?? 0,
               expectedTotal: pyResult.expected_total ?? null,
               extraction: "python",
+            });
+            return;
+          }
+
+          if (useOcr) {
+            let { rows, expectedTotal } = await extractExpensesFromOcr(
+              ocrPages,
+              pngBuffers,
+              (e) => send(e),
+            );
+            if (rows.length === 0) {
+              ({ rows, expectedTotal } = await extractExpenses(
+                pngBuffers,
+                (e) => send(e),
+              ));
+              send({
+                type: "complete",
+                rows,
+                pageCount: pngBuffers.length,
+                expectedTotal,
+                extraction: "vision",
+              });
+              return;
+            }
+            send({
+              type: "complete",
+              rows,
+              pageCount: pngBuffers.length,
+              expectedTotal,
+              extraction: "ocr",
             });
             return;
           }
