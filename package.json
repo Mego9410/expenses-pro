@@ -7,8 +7,5 @@
     "dev": "npm run dev -w expenses-portal",
     "lint": "npm run lint -w expenses-portal",
     "start": "npm run start -w expenses-portal"
-  },
-  "dependencies": {
-    "next": "16.2.6"
   }
 }
