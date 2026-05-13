@@ -5,6 +5,7 @@ import { useDropzone } from "react-dropzone";
 import {
   AlertCircle,
   Check,
+  ClipboardCopy,
   Download,
   FileText,
   Loader2,
@@ -16,6 +17,12 @@ import {
   TriangleAlert,
   Upload,
 } from "lucide-react";
+import {
+  buildAlgorithmTuningMarkdown,
+  createFreshReport,
+  mergeServerEvent,
+  type ConsistencyReport,
+} from "@/lib/consistency-report";
 import { CATEGORIES, coerceCategory, type Category } from "@/lib/categories";
 import {
   sortRowsForStatement,
@@ -27,6 +34,12 @@ import { rasterizePdfClient } from "@/lib/pdf-client";
 import { ensureUploadBlobsFitBudget } from "@/lib/upload-budget";
 import { ocrStatementPages } from "@/lib/ocr-client";
 import { cn, formatGBP } from "@/lib/utils";
+
+function isLocalhostDiagnostics(): boolean {
+  if (typeof window === "undefined") return false;
+  const h = window.location.hostname;
+  return h === "localhost" || h === "127.0.0.1";
+}
 
 type Row = {
   id: string;
@@ -111,6 +124,10 @@ export default function Home() {
     "python" | "vision" | "ocr" | null
   >(null);
   const [expectedTotal, setExpectedTotal] = useState<number | null>(null);
+  /** Localhost-only: structured trace for tuning extraction / reconcile. */
+  const [consistencyReport, setConsistencyReport] =
+    useState<ConsistencyReport | null>(null);
+  const [reportCopied, setReportCopied] = useState(false);
   const [pageAdjust, setPageAdjust] = useState<PageAdjustState | null>(null);
   const [straightenBusy, setStraightenBusy] = useState(false);
   const extractAbortRef = useRef<AbortController | null>(null);
@@ -147,6 +164,14 @@ export default function Home() {
   const total = useMemo(
     () => rows.reduce((sum, r) => sum + (Number.isFinite(r.gross) ? r.gross : 0), 0),
     [rows],
+  );
+
+  const consistencyReportMarkdown = useMemo(
+    () =>
+      consistencyReport
+        ? buildAlgorithmTuningMarkdown(consistencyReport)
+        : "",
+    [consistencyReport],
   );
 
   const previewUrls = useMemo(() => {
@@ -214,6 +239,8 @@ export default function Home() {
     setExtractedPages(null);
     setExtractionSource(null);
     setExpectedTotal(null);
+    setConsistencyReport(null);
+    setReportCopied(false);
 
     const renderTaskId = "render";
     upsertTask({
@@ -278,6 +305,7 @@ export default function Home() {
         state: "running",
       });
       let ocrJson: string | null = null;
+      let ocrCharTotal = 0;
       try {
         const pageTexts = await ocrStatementPages(pages, {
           signal,
@@ -292,8 +320,8 @@ export default function Home() {
         const capped = pageTexts.map((t) =>
           t.length > 18_000 ? t.slice(0, 18_000) : t,
         );
-        const charTotal = capped.join("").trim().length;
-        if (charTotal >= 80) {
+        ocrCharTotal = capped.join("").trim().length;
+        if (ocrCharTotal >= 80) {
           const payload = JSON.stringify(capped);
           if (new Blob([payload]).size < 1_800_000) {
             ocrJson = payload;
@@ -303,7 +331,7 @@ export default function Home() {
           id: "ocr",
           label:
             ocrJson !== null
-              ? `OCR: ${capped.length} page(s), ~${(charTotal / 1024).toFixed(1)} KB text`
+              ? `OCR: ${capped.length} page(s), ~${(ocrCharTotal / 1024).toFixed(1)} KB text`
               : "OCR produced little text — server will use vision on images",
           state: "done",
         });
@@ -338,6 +366,19 @@ export default function Home() {
       }
       if (ocrJson !== null) {
         fd.append("ocr_json", ocrJson);
+      }
+
+      const uploadKb = Math.round(
+        uploadPages.reduce((s, b) => s + b.size, 0) / 1024,
+      );
+      if (isLocalhostDiagnostics()) {
+        setConsistencyReport(
+          createFreshReport({
+            fileName: file?.name,
+            ocrTextCharsApprox: ocrCharTotal,
+            uploadPayloadKb: uploadKb,
+          }),
+        );
       }
 
       const res = await fetch("/api/extract", {
@@ -404,6 +445,7 @@ export default function Home() {
         setExtractedPages(null);
         setExpectedTotal(null);
         setExtractionSource(null);
+        setConsistencyReport(null);
         return;
       }
       setError(e instanceof Error ? e.message : "Extraction failed");
@@ -421,6 +463,26 @@ export default function Home() {
   function handleServerEvent(raw: unknown) {
     if (!raw || typeof raw !== "object") return;
     const event = raw as { type: string } & Record<string, unknown>;
+
+    const reportEventTypes = new Set([
+      "start",
+      "page_done",
+      "dedupe_done",
+      "reconcile_done",
+      "complete",
+    ]);
+    if (isLocalhostDiagnostics() && reportEventTypes.has(event.type)) {
+      setConsistencyReport((prev) =>
+        mergeServerEvent(
+          prev ??
+            createFreshReport({
+              fileName: file?.name,
+            }),
+          event as Record<string, unknown>,
+        ),
+      );
+    }
+
     switch (event.type) {
       case "start": {
         const pageCount = Number(event.pageCount) || 0;
@@ -963,6 +1025,48 @@ export default function Home() {
                     </li>
                   ))}
                 </ul>
+              </div>
+            )}
+
+            {isLocalhostDiagnostics() && consistencyReport && (
+              <div className="mt-5 rounded-xl border border-indigo-500/30 bg-indigo-500/[0.07] px-4 py-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <h3 className="text-sm font-semibold text-indigo-100">
+                    Consistency report{" "}
+                    <span className="font-normal text-indigo-200/80">
+                      (localhost only — paste into Cursor to tune the algorithm)
+                    </span>
+                  </h3>
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      try {
+                        await navigator.clipboard.writeText(
+                          consistencyReportMarkdown,
+                        );
+                        setReportCopied(true);
+                        window.setTimeout(() => setReportCopied(false), 2000);
+                      } catch {
+                        setReportCopied(false);
+                      }
+                    }}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-indigo-400/40 bg-indigo-500/20 px-2.5 py-1.5 text-xs font-medium text-indigo-100 hover:bg-indigo-500/30"
+                  >
+                    <ClipboardCopy className="h-3.5 w-3.5" />
+                    {reportCopied ? "Copied" : "Copy markdown"}
+                  </button>
+                </div>
+                <p className="mt-1 text-xs text-indigo-200/70">
+                  Updates live from the same SSE stream as the task list. Includes
+                  per-page counts, dedupe sum, each reconcile attempt, and
+                  heuristics for the next prompt/code change.
+                </p>
+                <textarea
+                  readOnly
+                  className="mt-3 h-64 w-full resize-y rounded-lg border border-white/10 bg-black/40 p-3 font-mono text-[11px] leading-relaxed text-neutral-200"
+                  value={consistencyReportMarkdown}
+                  spellCheck={false}
+                />
               </div>
             )}
 

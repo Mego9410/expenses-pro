@@ -741,6 +741,7 @@ export type ExtractProgressEvent =
       type: "reconcile_done";
       attempt: number;
       maxAttempts: number;
+      method: string;
       sum: number;
       expectedTotal: number | null;
       matched: boolean;
@@ -855,6 +856,7 @@ async function runExtractPostProcess(
         type: "reconcile_done",
         attempt,
         maxAttempts: MAX_ATTEMPTS,
+        method: RECONCILE_METHOD_LABELS[attemptN],
         sum: Number(sumRows(result.rows).toFixed(2)),
         expectedTotal: null,
         matched: false,
@@ -883,6 +885,7 @@ async function runExtractPostProcess(
       type: "reconcile_done",
       attempt,
       maxAttempts: MAX_ATTEMPTS,
+      method: RECONCILE_METHOD_LABELS[attemptN],
       sum: Number(attemptSum.toFixed(2)),
       expectedTotal: Number(compareExpected.toFixed(2)),
       matched: attemptMatched,
